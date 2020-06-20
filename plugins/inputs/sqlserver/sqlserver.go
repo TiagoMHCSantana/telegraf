@@ -267,7 +267,6 @@ func (s *SQLServer) initQueries() {
 
 	// Set a flag so we know that queries have already been initialized
 	s.isInitialized = true
-	return nil
 }
 
 func (s *SQLServer) includeConnStringsForLocalInstances() {
