@@ -1,11 +1,12 @@
 package sqlserver
 
 import (
-	"github.com/stretchr/testify/assert"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/influxdata/telegraf/testutil"
 	"github.com/stretchr/testify/require"
@@ -125,14 +126,14 @@ func TestSqlServer_MultipleInit(t *testing.T) {
 		ExcludeQuery: []string{"DatabaseSize"},
 	}
 
-	initQueries(s)
+	s.initQueries()
 	_, ok := s.queries["DatabaseSize"]
 	// acc includes size metrics
 	assert.True(t, ok)
 	assert.Equal(t, s.isInitialized, true)
 	assert.Equal(t, s2.isInitialized, false)
 
-	initQueries(s2)
+	s2.initQueries()
 	_, ok = s2.queries["DatabaseSize"]
 	// acc2 excludes size metrics
 	assert.False(t, ok)

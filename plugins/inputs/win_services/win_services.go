@@ -7,11 +7,13 @@ import (
 	"os"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/filter"
 	"github.com/influxdata/telegraf/plugins/inputs"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
+// ServiceErr type
 type ServiceErr struct {
 	Message string
 	Service string
@@ -22,6 +24,7 @@ func (e *ServiceErr) Error() string {
 	return fmt.Sprintf("%s: '%s': %v", e.Message, e.Service, e.Err)
 }
 
+// IsPermission checks whether an error is related to permission or not
 func IsPermission(err error) bool {
 	if err, ok := err.(*ServiceErr); ok {
 		return os.IsPermission(err.Err)
@@ -53,13 +56,17 @@ type WinSvcMgr struct {
 	realMgr *mgr.Mgr
 }
 
+// Disconnect ends up the connection with the service manager
 func (m *WinSvcMgr) Disconnect() error {
 	return m.realMgr.Disconnect()
 }
 
+// OpenService opens a specific service
 func (m *WinSvcMgr) OpenService(name string) (WinService, error) {
 	return m.realMgr.OpenService(name)
 }
+
+// ListServices lists the services installed
 func (m *WinSvcMgr) ListServices() ([]string, error) {
 	return m.realMgr.ListServices()
 }
@@ -68,16 +75,16 @@ func (m *WinSvcMgr) ListServices() ([]string, error) {
 type MgProvider struct {
 }
 
+// Connect connects to the service manager
 func (rmr *MgProvider) Connect() (WinServiceManager, error) {
 	scmgr, err := mgr.Connect()
 	if err != nil {
 		return nil, err
-	} else {
-		return &WinSvcMgr{scmgr}, nil
 	}
+	return &WinSvcMgr{scmgr}, nil
 }
 
-var sampleConfig = `
+const sampleConfig = `
   ## Names of the services to monitor. Leave empty to monitor all the available services on the host
   service_names = [
     "LanmanServer",
@@ -85,7 +92,7 @@ var sampleConfig = `
   ]
 `
 
-var description = "Input plugin to report Windows services info."
+const description = "Input plugin to report Windows services info."
 
 //WinServices is an implementation if telegraf.Input interface, providing info about Windows Services
 type WinServices struct {
@@ -93,8 +100,10 @@ type WinServices struct {
 
 	ServiceNames []string `toml:"service_names"`
 	mgrProvider  ManagerProvider
+	filter       filter.Filter
 }
 
+// ServiceInfo type
 type ServiceInfo struct {
 	ServiceName string
 	DisplayName string
@@ -102,22 +111,42 @@ type ServiceInfo struct {
 	StartUpMode int
 }
 
+// Description returns the description of the plugin
 func (m *WinServices) Description() string {
 	return description
 }
 
+// SampleConfig returns an example of configuration file for the plugin
 func (m *WinServices) SampleConfig() string {
 	return sampleConfig
 }
 
+func (m *WinServices) initFilter() error {
+	var err error
+	if len(m.ServiceNames) == 0 {
+		m.ServiceNames = append(m.ServiceNames, "*")
+	}
+	m.filter, err = filter.Compile(m.ServiceNames)
+
+	return err
+}
+
+// Gather collects samples from the objects tracked by the plugin
 func (m *WinServices) Gather(acc telegraf.Accumulator) error {
+	if m.filter == nil {
+		err := m.initFilter()
+		if err != nil {
+			return err
+		}
+	}
+
 	scmgr, err := m.mgrProvider.Connect()
 	if err != nil {
 		return fmt.Errorf("Could not open service manager: %s", err)
 	}
 	defer scmgr.Disconnect()
 
-	serviceNames, err := listServices(scmgr, m.ServiceNames)
+	serviceNames, err := listServices(scmgr, m.filter)
 	if err != nil {
 		return err
 	}
@@ -152,16 +181,20 @@ func (m *WinServices) Gather(acc telegraf.Accumulator) error {
 }
 
 // listServices returns a list of services to gather.
-func listServices(scmgr WinServiceManager, userServices []string) ([]string, error) {
-	if len(userServices) != 0 {
-		return userServices, nil
-	}
-
+func listServices(scmgr WinServiceManager, filter filter.Filter) ([]string, error) {
 	names, err := scmgr.ListServices()
 	if err != nil {
 		return nil, fmt.Errorf("Could not list services: %s", err)
 	}
-	return names, nil
+
+	var services []string
+	for _, svc := range names {
+		if filter.Match(svc) {
+			services = append(services, svc)
+		}
+	}
+
+	return services, nil
 }
 
 // collectServiceInfo gathers info about a service.

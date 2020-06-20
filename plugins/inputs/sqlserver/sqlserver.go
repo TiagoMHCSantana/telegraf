@@ -2,8 +2,13 @@ package sqlserver
 
 import (
 	"database/sql"
+	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/windows/registry"
 
 	_ "github.com/denisenkom/go-mssqldb" // go-mssqldb initialization
 	"github.com/influxdata/telegraf"
@@ -12,25 +17,28 @@ import (
 
 // SQLServer struct
 type SQLServer struct {
-	Servers       []string `toml:"servers"`
-	QueryVersion  int      `toml:"query_version"`
-	AzureDB       bool     `toml:"azuredb"`
-	ExcludeQuery  []string `toml:"exclude_query"`
-	queries       MapQuery
-	isInitialized bool
+	Servers                     []string `toml:"servers"`
+	QueryVersion                int      `toml:"query_version"`
+	AzureDB                     bool     `toml:"azuredb"`
+	IncludeQuery                []string `toml:"include_query"`
+	ExcludeQuery                []string `toml:"exclude_query"`
+	LocalInstancesAutoDiscovery bool     `toml:"local_instances_auto_discovery"`
+	TagKeys                     []string `toml:"tag_keys"`
+	includeQueries              map[string]struct{}
+	excludeQueries              map[string]struct{}
+	tags                        map[string]struct{}
+	queries                     MapQuery
+	isInitialized               bool
 }
 
 // Query struct
 type Query struct {
 	Script         string
-	ResultByRow    bool
 	OrderedColumns []string
 }
 
 // MapQuery type
 type MapQuery map[string]Query
-
-const defaultServer = "Server=.;app name=telegraf;log=1;"
 
 const sampleConfig = `
   ## Specify instances to monitor with a list of connection strings.
@@ -44,6 +52,10 @@ const sampleConfig = `
   #  "Server=192.168.1.10;Port=1433;User Id=<user>;Password=<pw>;app name=telegraf;log=1;",
   # ]
 
+  ## If you want to connect to all local mssql instances using Windows Authentication,
+  ## uncomment the following line and set it to true
+  # local_instances_auto_discovery = false
+
   ## Optional parameter, setting this to 2 will use a new version
   ## of the collection queries that break compatibility with the original
   ## dashboards.
@@ -52,24 +64,49 @@ const sampleConfig = `
   ## If you are using AzureDB, setting this to true will gather resource utilization metrics
   # azuredb = false
 
-  ## If you would like to exclude some of the metrics queries, list them here
-  ## Possible choices:
+  ## Queries metrics filtering
+  ## If you want to select which queries metrics are to be executed, use either
+  ## the options include_query and exclude_query.
+  ## Possible choices V1:
   ## - PerformanceCounters
   ## - WaitStatsCategorized
-  ## - DatabaseIO
-  ## - DatabaseProperties
   ## - CPUHistory
+  ## - DatabaseIO
   ## - DatabaseSize
   ## - DatabaseStats
+  ## - DatabaseProperties
   ## - MemoryClerk
   ## - VolumeSpace
   ## - PerformanceMetrics
+  ## Possible choices V2:
+  ## - PerformanceCounters
+  ## - WaitStatsCategorized
+  ## - DatabaseIO
+  ## - ServerProperties
+  ## - MemoryClerk
   ## - Schedulers
+  ## - SqlRequests
+  ## - AlwaysOnHealth
+  ## - CachedPlans
+  ## - InstanceWaits
+  ## - PageLifeExpectancy
+  ## - LogUsage
+  ## - DatabasesByInstance
+  ## - DatabasesOnAG
+  ## - JobRuns
+  ## - DatabaseProperties
+  ## - Backups
+  ## Possible choices for AzureDB using both query versions:
   ## - AzureDBResourceStats
   ## - AzureDBResourceGovernance
-  ## - SqlRequests
-  ## - ServerProperties
-  exclude_query = [ 'Schedulers' ]
+  ## If you want to include just a few metrics queries, list them here
+  # include_query = [ 'DatabaseIO', 'PerformanceCounters' ]
+  ## If you would like to exclude some of the metrics queries, list them here
+  ## This option is processed after the include_query one
+  # exclude_query = [ 'Schedulers', 'DatabaseStats' ]
+
+  ## Use this to configure which columns are to be tags
+  tag_keys = [ 'sql_instance', 'database', 'server' ]
 `
 
 // SampleConfig return the sample configuration
@@ -82,57 +119,190 @@ func (s *SQLServer) Description() string {
 	return "Read metrics from Microsoft SQL Server"
 }
 
-type scanner interface {
-	Scan(dest ...interface{}) error
+func (s *SQLServer) initIncludeQueries() {
+	s.includeQueries = make(map[string]struct{})
+	var empty struct{}
+
+	for _, query := range s.IncludeQuery {
+		s.includeQueries[query] = empty
+	}
 }
 
-func initQueries(s *SQLServer) {
+func (s *SQLServer) initExcludeQueries() {
+	s.excludeQueries = make(map[string]struct{})
+	var empty struct{}
+
+	for _, query := range s.ExcludeQuery {
+		s.excludeQueries[query] = empty
+	}
+}
+
+func (s *SQLServer) initTags() {
+	s.tags = make(map[string]struct{})
+	var empty struct{}
+
+	for _, query := range s.TagKeys {
+		s.tags[query] = empty
+	}
+}
+
+func (s *SQLServer) initQueries() {
+	s.initIncludeQueries()
+	s.initExcludeQueries()
+	s.initTags()
+
+	filter := func(queryMetricName string) bool {
+		var shouldInclude = true
+
+		if len(s.includeQueries) > 0 {
+			_, shouldInclude = s.includeQueries[queryMetricName]
+		}
+		if len(s.excludeQueries) > 0 {
+			_, ok := s.excludeQueries[queryMetricName]
+			shouldInclude = !ok
+		}
+
+		return shouldInclude
+	}
+
 	s.queries = make(MapQuery)
 	queries := s.queries
 	// If this is an AzureDB instance, grab some extra metrics
 	if s.AzureDB {
-		queries["AzureDBResourceStats"] = Query{Script: sqlAzureDBResourceStats, ResultByRow: false}
-		queries["AzureDBResourceGovernance"] = Query{Script: sqlAzureDBResourceGovernance, ResultByRow: false}
+		if filter("AzureDBResourceStats") {
+			queries["AzureDBResourceStats"] = Query{Script: sqlAzureDBResourceStats}
+		}
+		if filter("AzureDBResourceGovernance") {
+			queries["AzureDBResourceGovernance"] = Query{Script: sqlAzureDBResourceGovernance}
+		}
 	}
 
 	// Decide if we want to run version 1 or version 2 queries
 	if s.QueryVersion == 2 {
-		queries["PerformanceCounters"] = Query{Script: sqlPerformanceCountersV2, ResultByRow: true}
-		queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorizedV2, ResultByRow: false}
-		queries["DatabaseIO"] = Query{Script: sqlDatabaseIOV2, ResultByRow: false}
-		queries["ServerProperties"] = Query{Script: sqlServerPropertiesV2, ResultByRow: false}
-		queries["MemoryClerk"] = Query{Script: sqlMemoryClerkV2, ResultByRow: false}
-		queries["Schedulers"] = Query{Script: sqlServerSchedulersV2, ResultByRow: false}
-		queries["SqlRequests"] = Query{Script: sqlServerRequestsV2, ResultByRow: false}
+		if filter("PerformanceCounters") {
+			queries["PerformanceCounters"] = Query{Script: sqlPerformanceCountersV2}
+		}
+		if filter("WaitStatsCategorized") {
+			queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorizedV2}
+		}
+		if filter("DatabaseIO") {
+			queries["DatabaseIO"] = Query{Script: sqlDatabaseIOV2}
+		}
+		if filter("ServerProperties") {
+			queries["ServerProperties"] = Query{Script: sqlServerPropertiesV2}
+		}
+		if filter("MemoryClerk") {
+			queries["MemoryClerk"] = Query{Script: sqlMemoryClerkV2}
+		}
+		if filter("Schedulers") {
+			queries["Schedulers"] = Query{Script: sqlServerSchedulersV2}
+		}
+		if filter("SqlRequests") {
+			queries["SqlRequests"] = Query{Script: sqlServerRequestsV2}
+		}
+		if filter("AlwaysOnHealth") {
+			queries["AlwaysOnHealth"] = Query{Script: alwaysOnHealthV2}
+		}
+		if filter("CachedPlans") {
+			queries["CachedPlans"] = Query{Script: sqlCachedPlansV2}
+		}
+		if filter("InstanceWaits") {
+			queries["InstanceWaits"] = Query{Script: sqlInstanceWaitsV2}
+		}
+		if filter("PageLifeExpectancy") {
+			queries["PageLifeExpectancy"] = Query{Script: sqlPageLifeExpectancyV2}
+		}
+		if filter("LogUsage") {
+			queries["LogUsage"] = Query{Script: sqlLogUsageV2}
+		}
+		if filter("DatabasesByInstance") {
+			queries["DatabasesByInstance"] = Query{Script: sqlDatabasesByInstanceV2}
+		}
+		if filter("DatabasesOnAG") {
+			queries["DatabasesOnAG"] = Query{Script: sqlDatabasesOnAGV2}
+		}
+		if filter("JobRuns") {
+			queries["JobRuns"] = Query{Script: sqlJobRunsV2}
+		}
+		if filter("DatabaseProperties") {
+			queries["DatabaseProperties"] = Query{Script: sqlDatabasePropertiesV2}
+		}
+		if filter("Backups") {
+			queries["Backups"] = Query{Script: sqlBackupsV2}
+		}
 	} else {
-		queries["PerformanceCounters"] = Query{Script: sqlPerformanceCounters, ResultByRow: true}
-		queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorized, ResultByRow: false}
-		queries["CPUHistory"] = Query{Script: sqlCPUHistory, ResultByRow: false}
-		queries["DatabaseIO"] = Query{Script: sqlDatabaseIO, ResultByRow: false}
-		queries["DatabaseSize"] = Query{Script: sqlDatabaseSize, ResultByRow: false}
-		queries["DatabaseStats"] = Query{Script: sqlDatabaseStats, ResultByRow: false}
-		queries["DatabaseProperties"] = Query{Script: sqlDatabaseProperties, ResultByRow: false}
-		queries["MemoryClerk"] = Query{Script: sqlMemoryClerk, ResultByRow: false}
-		queries["VolumeSpace"] = Query{Script: sqlVolumeSpace, ResultByRow: false}
-		queries["PerformanceMetrics"] = Query{Script: sqlPerformanceMetrics, ResultByRow: false}
-	}
-
-	for _, query := range s.ExcludeQuery {
-		delete(queries, query)
+		if filter("PerformanceCounters") {
+			queries["PerformanceCounters"] = Query{Script: sqlPerformanceCounters}
+		}
+		if filter("WaitStatsCategorized") {
+			queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorized}
+		}
+		if filter("CPUHistory") {
+			queries["CPUHistory"] = Query{Script: sqlCPUHistory}
+		}
+		if filter("DatabaseIO") {
+			queries["DatabaseIO"] = Query{Script: sqlDatabaseIO}
+		}
+		if filter("DatabaseSize") {
+			queries["DatabaseSize"] = Query{Script: sqlDatabaseSize}
+		}
+		if filter("DatabaseStats") {
+			queries["DatabaseStats"] = Query{Script: sqlDatabaseStats}
+		}
+		if filter("DatabaseProperties") {
+			queries["DatabaseProperties"] = Query{Script: sqlDatabaseProperties}
+		}
+		if filter("MemoryClerk") {
+			queries["MemoryClerk"] = Query{Script: sqlMemoryClerk}
+		}
+		if filter("VolumeSpace") {
+			queries["VolumeSpace"] = Query{Script: sqlVolumeSpace}
+		}
+		if filter("PerformanceMetrics") {
+			queries["PerformanceMetrics"] = Query{Script: sqlPerformanceMetrics}
+		}
 	}
 
 	// Set a flag so we know that queries have already been initialized
 	s.isInitialized = true
 }
 
+func (s *SQLServer) includeConnStringsForLocalInstances() {
+	if instances, err := getLocalInstances(); err == nil {
+		if hostname, err := os.Hostname(); err == nil {
+			for _, instance := range instances {
+				if strings.ToUpper(instance) == "MSSQLSERVER" {
+					s.Servers = append(s.Servers, fmt.Sprintf("Server=%s;Integrated Security=SSPI;", hostname))
+				} else {
+					s.Servers = append(s.Servers, fmt.Sprintf(`Server=%s\%s;Integrated Security=SSPI;`, hostname, instance))
+				}
+			}
+		}
+	}
+}
+
+func getLocalInstances() ([]string, error) {
+	key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Microsoft SQL Server`, registry.QUERY_VALUE)
+	if err != nil {
+		return nil, err
+	}
+	defer key.Close()
+
+	instances, _, err := key.GetStringsValue("InstalledInstances")
+	if err != nil {
+		return nil, err
+	}
+
+	return instances, nil
+}
+
 // Gather collect data from SQL Server
 func (s *SQLServer) Gather(acc telegraf.Accumulator) error {
 	if !s.isInitialized {
-		initQueries(s)
-	}
-
-	if len(s.Servers) == 0 {
-		s.Servers = append(s.Servers, defaultServer)
+		s.initQueries()
+		if s.LocalInstancesAutoDiscovery {
+			s.includeConnStringsForLocalInstances()
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -181,7 +351,7 @@ func (s *SQLServer) gatherServer(server string, query Query, acc telegraf.Accumu
 	return rows.Err()
 }
 
-func (s *SQLServer) accRow(query Query, acc telegraf.Accumulator, row scanner) error {
+func (s *SQLServer) accRow(query Query, acc telegraf.Accumulator, row *sql.Rows) error {
 	var columnVars []interface{}
 	var fields = make(map[string]interface{})
 
@@ -189,11 +359,10 @@ func (s *SQLServer) accRow(query Query, acc telegraf.Accumulator, row scanner) e
 	columnMap := make(map[string]*interface{})
 	for _, column := range query.OrderedColumns {
 		columnMap[column] = new(interface{})
+		// populate the array of interface{} with the pointers in the right order
+		columnVars = append(columnVars, columnMap[column])
 	}
-	// populate the array of interface{} with the pointers in the right order
-	for i := 0; i < len(columnMap); i++ {
-		columnVars = append(columnVars, columnMap[query.OrderedColumns[i]])
-	}
+
 	// deconstruct array of variables and send to Scan
 	err := row.Scan(columnVars...)
 	if err != nil {
@@ -202,33 +371,25 @@ func (s *SQLServer) accRow(query Query, acc telegraf.Accumulator, row scanner) e
 
 	// measurement: identified by the header
 	// tags: all other fields of type string
+	isTag := func(header string) bool {
+		_, ok := s.tags[header]
+		return ok
+	}
 	tags := map[string]string{}
 	var measurement string
 	for header, val := range columnMap {
-		if str, ok := (*val).(string); ok {
-			if header == "measurement" {
-				measurement = str
-			} else {
-				tags[header] = str
-			}
+		if header == "measurement" {
+			measurement = (*val).(string)
+		} else if isTag(header) {
+			tags[header] = (*val).(string)
+		} else {
+			fields[header] = (*val)
 		}
 	}
 
-	if query.ResultByRow {
-		// add measurement to Accumulator
-		acc.AddFields(measurement,
-			map[string]interface{}{"value": *columnMap["value"]},
-			tags, time.Now())
-	} else {
-		// values
-		for header, val := range columnMap {
-			if _, ok := (*val).(string); !ok {
-				fields[header] = (*val)
-			}
-		}
-		// add fields to Accumulator
-		acc.AddFields(measurement, fields, tags, time.Now())
-	}
+	// add fields to Accumulator
+	acc.AddFields(measurement, fields, tags, time.Now())
+
 	return nil
 }
 
@@ -237,6 +398,324 @@ func init() {
 		return &SQLServer{}
 	})
 }
+
+const sqlBackupsV2 string = `SET DEADLOCK_PRIORITY -10;
+WITH query AS (
+	SELECT
+		X.[name] AS [database],
+		(CASE T.[type]
+			WHEN 'D' THEN 'Full Backup'
+			WHEN 'I' THEN 'Differential Backup'
+			WHEN 'L' THEN 'TLog Backup'
+			WHEN 'F' THEN 'File or filegroup'
+			WHEN 'G' THEN 'Differential file'
+			WHEN 'P' THEN 'Partial'
+			WHEN 'Q' THEN 'Differential Partial'
+			ELSE 'Unknown'
+		END) AS [backup_type],
+		X.recovery_model_desc AS [recovery_model],
+		ISNULL(B.backup_start_date, CAST('1970-01-01' AS DATETIME)) AS [backup_start_date],
+		ISNULL(B.backup_finish_date, CAST('1970-01-01' AS DATETIME)) AS [backup_finish_date],
+		ISNULL(DATEDIFF(SECOND,B.backup_start_date, B.backup_finish_date), 0) AS [total_time_taken_s],
+		B.expiration_date,
+		B.[user_name],
+		B.machine_name,
+		B.is_password_protected,
+		X.collation_name,
+		B.is_copy_only,
+		ISNULL(CONVERT(NUMERIC(20, 2), B.backup_size / 1048576), 0.0) AS [backup_size_mb],
+		A.logical_device_name,
+		A.physical_device_name,
+		B.[name] AS backupset_name,
+		B.[description],
+		B.has_backup_checksums,
+		B.is_damaged,
+		B.has_incomplete_metadata,
+		sys.fn_hadr_backup_is_preferred_replica(X.[name]) AS [is_backup_preferred_replica],
+		ROW_NUMBER() OVER (PARTITION BY X.[name], T.[type] ORDER BY backup_finish_date DESC) AS rn
+	FROM
+		sys.databases X WITH (NOLOCK)
+		JOIN (
+			SELECT [name], 'D' AS [type] FROM sys.databases WITH (NOLOCK)
+			UNION
+			SELECT [name], 'L' AS [type] FROM sys.databases WITH (NOLOCK)
+		) AS T
+			ON X.[name] = T.[name]
+		LEFT JOIN msdb.dbo.backupset B WITH (NOLOCK)
+			ON X.[name] = B.[database_name] AND T.[type] = B.[type]
+			AND B.[type] IN ('D', 'L')
+		LEFT JOIN msdb.dbo.backupmediafamily A WITH (NOLOCK) ON A.media_set_id = B.media_set_id
+	WHERE
+		X.[name] NOT IN ('tempdb', 'model', 'master', 'msdb', 'DBAASCONTROLE')
+)
+SELECT
+	'sqlserver_backup' AS [measurement],
+	REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+	[database],
+	backup_type,
+	recovery_model,
+	DATEDIFF_BIG(SECOND, backup_start_date, GETDATE()) AS [seconds_since_backup_start],
+	DATEDIFF_BIG(SECOND, backup_finish_date, GETDATE()) AS [seconds_since_backup_finish],
+	total_time_taken_s,
+	expiration_date,
+	[user_name],
+	machine_name,
+	is_password_protected,
+	collation_name,
+	is_copy_only,
+	backup_size_mb,
+	logical_device_name,
+	physical_device_name,
+	backupset_name,
+	description,
+	has_backup_checksums,
+	is_damaged,
+	has_incomplete_metadata,
+	is_backup_preferred_replica
+FROM query
+WHERE rn=1
+`
+
+const sqlDatabasePropertiesV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT
+	'sqlserver_database_properties' AS [measurement],
+	REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+	[name] AS [database],
+	[compatibility_level],
+	is_auto_close_on,
+	is_auto_create_stats_on,
+	is_auto_create_stats_incremental_on,
+	is_auto_update_stats_on,
+	is_auto_update_stats_async_on,
+	is_auto_shrink_on,
+	state,
+	state_desc,
+	is_trustworthy_on,
+	is_parameterization_forced,
+	is_read_only
+FROM
+	sys.databases WITH (NOLOCK)
+`
+
+const sqlJobRunsV2 string = `SET DEADLOCK_PRIORITY -10;
+WITH jobs AS (
+	SELECT
+		jobs.name,
+		DATEDIFF_BIG(SS,
+			DATEADD(SS,
+				jobhistory.run_duration,
+				msdb.dbo.agent_datetime(jobhistory.run_date,jobhistory.run_time)),
+			GETDATE()
+		) AS seconds_since_exec,
+		ROW_NUMBER() OVER (PARTITION BY jobs.name ORDER BY msdb.dbo.agent_datetime(jobhistory.run_date,jobhistory.run_time) DESC) AS rownum,
+		run_status,
+		CASE
+			WHEN run_status = 0
+				THEN 'Failed'
+			WHEN run_status = 1
+				THEN 'Succeeded'
+			WHEN run_status = 2
+				THEN 'Retry'
+			WHEN run_status = 3
+				THEN 'Canceled'
+			WHEN run_status = 4
+				THEN 'In Progress'
+			ELSE 'Unknown'
+		END AS run_status_desc,
+		freq_type AS frequency,
+		CASE
+			WHEN freq_type = 1
+				THEN 'One time only'
+			WHEN freq_type = 4
+				THEN 'Daily'
+			WHEN freq_type = 8
+				THEN 'Weekly'
+			WHEN freq_type = 16
+				THEN 'Monthly'
+			WHEN freq_type = 32
+				THEN 'Monthly, relative to freq_interval'
+			WHEN freq_type = 64
+				THEN 'Runs when the SQL Server Agent service starts'
+			WHEN freq_type = 128
+				THEN 'Runs when the computer is idle'
+			ELSE 'Unknown'
+		END AS frequency_desc,
+		jobs.enabled AS is_job_enabled,
+		schedules.enabled AS is_schedule_enabled
+FROM
+	msdb.dbo.sysjobs AS jobs
+	INNER JOIN msdb.dbo.sysjobschedules AS jobschedules
+		ON jobs.job_id = jobschedules.job_id
+	INNER JOIN msdb.dbo.sysschedules AS schedules
+		ON jobschedules.schedule_id = schedules.schedule_id
+	LEFT JOIN msdb.dbo.sysjobhistory AS jobhistory
+		ON (jobs.job_id = jobhistory.job_id) )
+
+SELECT
+	'sqlserver_job_runs' AS [measurement],
+	REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+	name AS [job_name],
+	seconds_since_exec,
+	run_status,
+	run_status_desc,
+	frequency,
+	frequency_desc,
+	is_job_enabled,
+	is_schedule_enabled
+FROM jobs
+WHERE rownum = 1
+`
+
+const sqlPageLifeExpectancyV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT
+	'sqlserver_page_life_expectancy' AS [measurement]
+	, REPLACE(@@SERVERNAME,'\',':') AS [sql_instance]
+	,[cntr_value] AS [value]
+FROM sys.dm_os_performance_counters WITH (NOLOCK)
+WHERE [object_name] LIKE '%Manager%'
+AND [counter_name] = 'Page life expectancy'
+`
+
+const sqlLogUsageV2 string = `SET DEADLOCK_PRIORITY -10;
+DECLARE @result TABLE
+(
+ [database] VARCHAR(150) ,
+ [log_size_mb] FLOAT ,
+ [percent_log_used] FLOAT ,
+ [status] VARCHAR(100)
+)
+
+INSERT INTO @result
+EXEC ( 'DBCC sqlperf(LOGSPACE) WITH NO_INFOMSGS')
+
+SELECT 'sqlserver_log_usage' AS [measurement],
+		REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+		[database],
+		[log_size_mb],
+		ROUND([percent_log_used], 2) AS [percent_log_used]
+FROM @result
+WHERE [database] NOT IN ('master', 'model', 'msdb', 'DBAASCONTROLE', 'MonitorRM')
+`
+
+const sqlDatabasesByInstanceV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT
+	'sqlserver_databases_per_instance' AS [measurement],
+	REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+	COUNT(*) [qty_databases]
+FROM sys.databases WITH (NOLOCK)
+WHERE [name] NOT IN ('master','model','msdb','tempdb','DBAASCONTROLE','MonitorRM')
+`
+
+const sqlDatabasesOnAGV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT
+	'sqlserver_databases_on_ag' AS [measurement],
+	REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+	[name] AS [database],
+	DATEDIFF_BIG(MS, create_date, GETDATE()) AS [time_elapsed_create_ms],
+	(SELECT SERVERPROPERTY('IsHadrEnabled')) [is_hadr_enabled],
+	(SELECT SERVERPROPERTY('IsClustered')) [is_clustered],
+	CASE WHEN [replica_id] IS NULL THEN 0 ELSE 1 END AS [is_on_ag]
+FROM
+	sys.databases WITH (NOLOCK)
+WHERE
+	DB_NAME(database_id) not in ('master', 'msdb', 'tempdb', 'model', 'DBAASCONTROLE','MonitorRM')
+`
+
+const alwaysOnHealthV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT 'sqlserver_alwayson_health' AS [measurement]
+    , ag.name AS [avaliability_group]
+    , REPLACE(ar.replica_server_name, '\', ':') AS [server]
+    , CASE WHEN ars.is_local = 1 THEN 'Local' ELSE 'Remote' END AS [db_location]
+    , ars.role_desc AS [replica_role]
+    , ars.synchronization_health AS [health_state]
+FROM sys.availability_groups ag WITH (NOLOCK)
+   JOIN sys.availability_replicas ar WITH (NOLOCK)
+       ON ag.group_id = ar.group_id
+   JOIN sys.dm_hadr_availability_replica_states ars WITH (NOLOCK)
+       ON ar.replica_id=ars.replica_id
+OPTION (RECOMPILE, MAXDOP 1);
+`
+
+const sqlCachedPlansV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT 'sqlserver_cached_plans' AS [measurement],
+REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+COUNT(*) AS cached_plans
+FROM sys.dm_exec_cached_plans WITH (NOLOCK)
+`
+
+const sqlInstanceWaitsV2 string = `
+SET DEADLOCK_PRIORITY -10;
+WITH [Waits] AS
+    (SELECT
+        [wait_type],
+        [wait_time_ms] / 1000.0 AS [WaitS],
+        ([wait_time_ms] - [signal_wait_time_ms]) / 1000.0 AS [ResourceS],
+        [signal_wait_time_ms] / 1000.0 AS [SignalS],
+        [waiting_tasks_count] AS [WaitCount],
+       100.0 * [wait_time_ms] / SUM ([wait_time_ms]) OVER() AS [Percentage],
+        ROW_NUMBER() OVER(ORDER BY [wait_time_ms] DESC) AS [RowNum]
+    FROM sys.dm_os_wait_stats WITH (NOLOCK)
+    WHERE [wait_type] NOT IN (
+        N'BROKER_EVENTHANDLER', N'BROKER_RECEIVE_WAITFOR',
+        N'BROKER_TASK_STOP', N'BROKER_TO_FLUSH',
+        N'BROKER_TRANSMITTER', N'CHECKPOINT_QUEUE',
+        N'CHKPT', N'CLR_AUTO_EVENT',
+        N'CLR_MANUAL_EVENT', N'CLR_SEMAPHORE',
+ 
+        -- Maybe uncomment these four if you have mirroring issues
+        N'DBMIRROR_DBM_EVENT', N'DBMIRROR_EVENTS_QUEUE',
+        N'DBMIRROR_WORKER_QUEUE', N'DBMIRRORING_CMD',
+ 
+        N'DIRTY_PAGE_POLL', N'DISPATCHER_QUEUE_SEMAPHORE',
+        N'EXECSYNC', N'FSAGENT',
+        N'FT_IFTS_SCHEDULER_IDLE_WAIT', N'FT_IFTSHC_MUTEX',
+ 
+        -- Maybe uncomment these six if you have AG issues
+        N'HADR_CLUSAPI_CALL', N'HADR_FILESTREAM_IOMGR_IOCOMPLETION',
+        N'HADR_LOGCAPTURE_WAIT', N'HADR_NOTIFICATION_DEQUEUE',
+        N'HADR_TIMER_TASK', N'HADR_WORK_QUEUE',
+ 
+        N'KSOURCE_WAKEUP', N'LAZYWRITER_SLEEP',
+        N'LOGMGR_QUEUE', N'MEMORY_ALLOCATION_EXT',
+        N'ONDEMAND_TASK_QUEUE',
+        N'PREEMPTIVE_XE_GETTARGETSTATE',
+        N'PWAIT_ALL_COMPONENTS_INITIALIZED',
+        N'PWAIT_DIRECTLOGCONSUMER_GETNEXT',
+        N'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP', N'QDS_ASYNC_QUEUE',
+        N'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+        N'QDS_SHUTDOWN_QUEUE', N'REDO_THREAD_PENDING_WORK',
+        N'REQUEST_FOR_DEADLOCK_SEARCH', N'RESOURCE_QUEUE',
+        N'SERVER_IDLE_CHECK', N'SLEEP_BPOOL_FLUSH',
+        N'SLEEP_DBSTARTUP', N'SLEEP_DCOMSTARTUP',
+        N'SLEEP_MASTERDBREADY', N'SLEEP_MASTERMDREADY',
+        N'SLEEP_MASTERUPGRADED', N'SLEEP_MSDBSTARTUP',
+        N'SLEEP_SYSTEMTASK', N'SLEEP_TASK',
+        N'SLEEP_TEMPDBSTARTUP', N'SNI_HTTP_ACCEPT',
+        N'SP_SERVER_DIAGNOSTICS_SLEEP', N'SQLTRACE_BUFFER_FLUSH',
+        N'SQLTRACE_INCREMENTAL_FLUSH_SLEEP',
+        N'SQLTRACE_WAIT_ENTRIES', N'WAIT_FOR_RESULTS',
+        N'WAITFOR', N'WAITFOR_TASKSHUTDOWN',
+        N'WAIT_XTP_RECOVERY',
+        N'WAIT_XTP_HOST_WAIT', N'WAIT_XTP_OFFLINE_CKPT_NEW_LOG',
+        N'WAIT_XTP_CKPT_CLOSE', N'XE_DISPATCHER_JOIN',
+        N'XE_DISPATCHER_WAIT', N'XE_TIMER_EVENT')
+    AND [waiting_tasks_count] > 0
+    )
+SELECT
+	'sqlserver_instance_waits' As [measurement],
+	REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
+    MAX ([W1].[wait_type]) AS [wait_type],
+    CAST (MAX ([W1].[WaitS]) AS DECIMAL (16,2)) AS [wait_s],
+    CAST (MAX ([W1].[ResourceS]) AS DECIMAL (16,2)) AS [resource_s],
+    CAST (MAX ([W1].[SignalS]) AS DECIMAL (16,2)) AS [signal_s],
+    MAX ([W1].[WaitCount]) AS [wait_count],
+    CAST (MAX ([W1].[Percentage]) AS DECIMAL (5,2)) AS [percentage]
+FROM [Waits] AS [W1]
+INNER JOIN [Waits] AS [W2]
+    ON [W2].[RowNum] <= [W1].[RowNum]
+GROUP BY [W1].[RowNum]
+HAVING SUM ([W2].[Percentage]) - MAX( [W1].[Percentage] ) < 95; -- percentage threshold
+`
 
 // Queries - V2
 // Thanks Bob Ward (http://aka.ms/bobwardms)
@@ -1432,11 +1911,11 @@ SELECT
 	,r.granted_query_memory as granted_query_memory_pages
 	, r.percent_complete
 	, (SUBSTRING(qt.text, r.statement_start_offset / 2 + 1,
-											(CASE WHEN r.statement_end_offset = -1
-													THEN LEN(CONVERT(NVARCHAR(MAX), qt.text)) * 2
-													ELSE r.statement_end_offset
-											END - r.statement_start_offset) / 2)
-		) AS statement_text
+		(CASE WHEN r.statement_end_offset = -1
+				THEN LEN(CONVERT(NVARCHAR(MAX), qt.text)) * 2
+				ELSE r.statement_end_offset
+		END - r.statement_start_offset) / 2)
+) AS statement_text
 	, qt.objectid
 	, QUOTENAME(OBJECT_SCHEMA_NAME(qt.objectid,qt.dbid)) + '.' +  QUOTENAME(OBJECT_NAME(qt.objectid,qt.dbid)) as stmt_object_name
 	, DB_NAME(qt.dbid) stmt_db_name
