@@ -12,6 +12,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSqlServer_QueriesInclusionExclusion(t *testing.T) {
+	cases := []map[string]interface{}{
+		{
+			"IncludeQuery": []string{},
+			"ExcludeQuery": []string{"WaitStatsCategorized", "DatabaseIO", "ServerProperties", "MemoryClerk", "Schedulers", "VolumeSpace", "Cpu"},
+			"queries":      []string{"PerformanceCounters", "SqlRequests"},
+			"queriesTotal": 2,
+		},
+		{
+			"IncludeQuery": []string{"PerformanceCounters", "SqlRequests"},
+			"ExcludeQuery": []string{"SqlRequests", "WaitStatsCategorized", "DatabaseIO", "VolumeSpace", "Cpu"},
+			"queries":      []string{"PerformanceCounters"},
+			"queriesTotal": 1,
+		},
+	}
+
+	for _, test := range cases {
+		s := SQLServer{
+			QueryVersion: 2,
+			IncludeQuery: test["IncludeQuery"].([]string),
+			ExcludeQuery: test["ExcludeQuery"].([]string),
+		}
+		initQueries(&s)
+		assert.Equal(t, len(s.queries), test["queriesTotal"].(int))
+		for _, query := range test["queries"].([]string) {
+			assert.Contains(t, s.queries, query)
+		}
+	}
+}
+
 func TestSqlServer_ParseMetrics(t *testing.T) {
 
 	var acc testutil.Accumulator

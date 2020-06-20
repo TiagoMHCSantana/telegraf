@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/testutil"
-
 	"github.com/stretchr/testify/require"
 )
 
@@ -205,6 +205,37 @@ func TestWriteKeepDatabase(t *testing.T) {
 			map[string]string{"host": hostTag, "database": "mydb"},
 		)
 	}
+}
+
+func TestWriteRetentionPolicyTag(t *testing.T) {
+	listener := newTestListener()
+	listener.RetentionPolicyTag = "rp"
+
+	acc := &testutil.Accumulator{}
+	require.NoError(t, listener.Init())
+	require.NoError(t, listener.Start(acc))
+	defer listener.Stop()
+
+	resp, err := http.Post(createURL(listener, "http", "/write", "rp=myrp"), "", bytes.NewBuffer([]byte("cpu time_idle=42")))
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, 204, resp.StatusCode)
+
+	expected := []telegraf.Metric{
+		testutil.MustMetric(
+			"cpu",
+			map[string]string{
+				"rp": "myrp",
+			},
+			map[string]interface{}{
+				"time_idle": 42.0,
+			},
+			time.Unix(0, 0),
+		),
+	}
+
+	acc.Wait(1)
+	testutil.RequireMetricsEqual(t, expected, acc.GetTelegrafMetrics(), testutil.IgnoreTime())
 }
 
 // http listener should add a newline at the end of the buffer if it's not there
@@ -477,7 +508,7 @@ func TestWriteEmpty(t *testing.T) {
 	require.EqualValues(t, 204, resp.StatusCode)
 }
 
-func TestQueryAndPing(t *testing.T) {
+func TestQuery(t *testing.T) {
 	listener := newTestListener()
 
 	acc := &testutil.Accumulator{}
@@ -490,12 +521,38 @@ func TestQueryAndPing(t *testing.T) {
 		createURL(listener, "http", "/query", "db=&q=CREATE+DATABASE+IF+NOT+EXISTS+%22mydb%22"), "", nil)
 	require.NoError(t, err)
 	require.EqualValues(t, 200, resp.StatusCode)
+}
+
+func TestPing(t *testing.T) {
+	listener := newTestListener()
+	acc := &testutil.Accumulator{}
+	require.NoError(t, listener.Init())
+	require.NoError(t, listener.Start(acc))
+	defer listener.Stop()
 
 	// post ping to listener
-	resp, err = http.Post(createURL(listener, "http", "/ping", ""), "", nil)
+	resp, err := http.Post(createURL(listener, "http", "/ping", ""), "", nil)
 	require.NoError(t, err)
+	require.Equal(t, "1.0", resp.Header["X-Influxdb-Version"][0])
+	require.Len(t, resp.Header["Content-Type"], 0)
 	resp.Body.Close()
 	require.EqualValues(t, 204, resp.StatusCode)
+}
+
+func TestPingVerbose(t *testing.T) {
+	listener := newTestListener()
+	acc := &testutil.Accumulator{}
+	require.NoError(t, listener.Init())
+	require.NoError(t, listener.Start(acc))
+	defer listener.Stop()
+
+	// post ping to listener
+	resp, err := http.Post(createURL(listener, "http", "/ping", "verbose=1"), "", nil)
+	require.NoError(t, err)
+	require.Equal(t, "1.0", resp.Header["X-Influxdb-Version"][0])
+	require.Equal(t, "application/json", resp.Header["Content-Type"][0])
+	resp.Body.Close()
+	require.EqualValues(t, 200, resp.StatusCode)
 }
 
 func TestWriteWithPrecision(t *testing.T) {
