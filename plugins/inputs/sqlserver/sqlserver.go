@@ -1,3 +1,5 @@
+// +build windows
+
 package sqlserver
 
 import (
@@ -86,6 +88,11 @@ query_version = 2
 ## - JobRuns
 ## - DatabaseProperties
 ## - Backups
+## - OrphanedUsers
+## - UsersSysadmin
+## - LockedUsers
+## - PolicyChecked
+## - DiskUsage
 ## Version 1:
 ## - PerformanceCounters
 ## - WaitStatsCategorized
@@ -231,6 +238,21 @@ func (s *SQLServer) initQueries() {
 		}
 		if filter("Backups") {
 			queries["Backups"] = Query{Script: sqlBackupsV2}
+		}
+		if filter("OrphanedUsers") {
+			queries["OrphanedUsers"] = Query{Script: sqlOrphanedUsersV2}
+		}
+		if filter("UsersSysadmin") {
+			queries["UsersSysadmin"] = Query{Script: sqlUsersSysadminV2}
+		}
+		if filter("LockedUsers") {
+			queries["LockedUsers"] = Query{Script: sqlLockedUsersV2}
+		}
+		if filter("PolicyChecked") {
+			queries["PolicyChecked"] = Query{Script: sqlPolicyCheckedV2}
+		}
+		if filter("DiskUsage") {
+			queries["DiskUsage"] = Query{Script: sqlDiskUsageV2}
 		}
 	} else {
 		if filter("PerformanceCounters") {
@@ -400,6 +422,152 @@ func init() {
 		return &SQLServer{}
 	})
 }
+
+const sqlDiskUsageV2 string = `SET DEADLOCK_PRIORITY -10;
+IF (OBJECT_ID('tempdb..#Datafile_Size') IS NOT NULL) DROP TABLE #Datafile_Size
+SELECT
+	'sqlserver_disk_usage' as [measurement],
+	REPLACE(@@SERVERNAME,'\',':') as [sql_instance],
+    B.database_id AS database_id,
+    B.[name] AS [database],
+    A.state_desc,
+    A.[type_desc],
+    A.[file_id],
+    A.[name],
+    A.physical_name,
+    CAST(C.total_bytes / 1073741824.0 AS NUMERIC(18, 2)) AS disk_total_size_GB,
+    CAST(C.available_bytes / 1073741824.0 AS NUMERIC(18, 2)) AS disk_free_size_GB,
+    CAST(A.size / 128 / 1024.0 AS NUMERIC(18, 2)) AS size_GB,
+    CAST(A.max_size / 128 / 1024.0 AS NUMERIC(18, 2)) AS max_size_GB,
+    CAST(
+        (CASE
+        WHEN A.growth <= 0 THEN A.size / 128 / 1024.0
+            WHEN A.max_size <= 0 THEN C.total_bytes / 1073741824.0
+            WHEN A.max_size / 128 / 1024.0 > C.total_bytes / 1073741824.0 THEN C.total_bytes / 1073741824.0
+            ELSE A.max_size / 128 / 1024.0
+        END) AS NUMERIC(18, 2)) AS max_real_size_GB,
+    CAST(NULL AS NUMERIC(18, 2)) AS free_space_GB,
+    (CASE WHEN A.is_percent_growth = 1 THEN A.growth ELSE CAST(A.growth / 128 AS NUMERIC(18, 2)) END) AS growth_MB,
+    A.is_percent_growth,
+    (CASE WHEN A.growth <= 0 THEN 0 ELSE 1 END) AS is_autogrowth_enabled,
+    CAST(NULL AS NUMERIC(18, 2)) AS percent_used,
+    CAST(NULL AS INT) AS growth_times
+INTO
+    #Datafile_Size
+FROM
+    sys.master_files        A   WITH(NOLOCK)
+    JOIN sys.databases      B   WITH(NOLOCK)    ON  A.database_id = B.database_id
+    CROSS APPLY sys.dm_os_volume_stats(A.database_id, A.[file_id]) C
+ 
+    
+UPDATE A
+SET
+    A.free_space_GB = (
+    (CASE
+        WHEN max_size_GB <= 0 THEN A.disk_free_size_GB
+        WHEN max_real_size_GB > disk_free_size_GB THEN A.disk_free_size_GB
+        ELSE max_real_size_GB - size_GB
+    END)),
+    A.percent_used = (size_GB / (CASE WHEN max_real_size_GB > disk_total_size_GB THEN A.disk_total_size_GB ELSE max_real_size_GB END)) * 100
+FROM
+    #Datafile_Size A
+    
+ 
+UPDATE A
+SET
+    A.growth_times =
+    (CASE
+        WHEN A.growth_MB <= 0 THEN 0
+        WHEN A.is_percent_growth = 0 THEN (A.max_real_size_GB - A.size_GB) / (A.growth_MB / 1024.0)
+        ELSE -1
+    END)
+FROM
+    #Datafile_Size A
+ 
+ 
+SELECT *
+FROM #Datafile_Size
+`
+
+const sqlPolicyCheckedV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT
+	'sqlserver_policy_checked' AS [measurement],
+	@@SERVERNAME AS [server],
+	[name] AS [login_name],
+	is_policy_checked,
+	LOGINPROPERTY(name, 'islocked') AS [is_locked]
+FROM sys.sql_logins (NOLOCK)
+WHERE [name] NOT LIKE '#%'
+`
+
+const sqlLockedUsersV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT	'sqlserver_locked_users' as [measurement],
+		@@servername as [server],
+		loginname as [login_name],
+		denylogin as [deny_login],
+		hasaccess as [has_access],
+		isntuser as [is_nt_user],
+		ISNULL(LOGINPROPERTY(loginname,'islocked'),0) as [is_locked]
+FROM sys.syslogins [L] WITH (NOLOCK)
+JOIN sys.server_principals [P] WITH (NOLOCK)
+	ON [L].sid = [P].[sid]
+WHERE [P].[type] <> 'C'
+`
+
+const sqlUsersSysadminV2 string = `SET DEADLOCK_PRIORITY -10;
+SELECT	'sqlserver_users_sysadmin' as [measurement],
+		@@SERVERNAME as [server],
+		sv.name as [login_name],
+		type_desc,
+		is_disabled,
+		sl.isntgroup as [is_nt_group],
+		ISNULL(IS_SRVROLEMEMBER('sysadmin',sv.name),0) as [is_sysadmin]
+FROM sys.server_principals sv WITH (NOLOCK)
+JOIN sys.syslogins sl WITH (NOLOCK)
+	ON sv.sid=sl.sid
+ORDER BY sv.name
+`
+
+const sqlOrphanedUsersV2 string = `SET DEADLOCK_PRIORITY -10;
+declare @usuarios_orfaos table (ds_database varchar(256), ds_usuario varchar(256))
+declare @query varchar(2000)
+declare @versao varchar(200)
+declare @resultado xml
+
+set @query = '
+select
+  ''?'' as [database_name],
+  [?].sys.database_principals.[name] as [user]
+from
+  [?].sys.database_principals with(nolock)  
+  left join [?].sys.server_principals with(nolock)  
+  on [?].sys.database_principals.sid = [?].sys.server_principals.sid  
+where [?].sys.server_principals.sid is null  
+  and [?].sys.database_principals.authentication_type_desc = ''instance'''
+
+insert into @usuarios_orfaos (ds_database, ds_usuario)
+exec master.dbo.sp_MSforeachdb @query
+
+set @resultado = null
+
+set @resultado = (
+    select
+        ds_database as 'usuario/@database',
+        ds_usuario as 'usuario/@usuario'
+    from
+        @usuarios_orfaos
+    order by
+        1, 2
+    for xml path(''), root('usuarios_orfaos'), type
+)
+
+select 'sqlserver_orphaned_users' as [measurement],
+@@servername as [server],
+ds_database as [database],
+ds_usuario as [username],
+1 as [value]
+from @usuarios_orfaos
+`
 
 const sqlBackupsV2 string = `SET DEADLOCK_PRIORITY -10;
 WITH query AS (
@@ -968,7 +1136,12 @@ DECLARE @sys_info TABLE (
 	hardware_type VARCHAR(16),
 	total_storage_mb BIGINT,
 	available_storage_mb BIGINT,
-	uptime INT
+	uptime INT,
+	affinity_type INT,
+	affinity_type_desc NVARCHAR(120),
+	socket_count INT,
+	cores_per_socket INT,
+	numa_node_count INT
 )
 
 IF @EngineEdition = 8  /*Managed Instance*/
@@ -1012,9 +1185,9 @@ BEGIN
 		SET @Columns = N',CASE [virtual_machine_type_desc] 
 			WHEN ''NONE'' THEN ''PHYSICAL Machine''
 			ELSE [virtual_machine_type_desc]
-		END AS [hardware_type]';
+		END AS [hardware_type],';
 	ELSE /*data not available*/
-		SET @Columns = N',''<n/a>'' AS [hardware_type]';
+		SET @Columns = N',''<n/a>'' AS [hardware_type],';
 
 	SET @SqlStatement = '
 	SELECT
@@ -1024,44 +1197,35 @@ BEGIN
 		,@EngineEdition AS [engine_edition]
 		,DATEDIFF(MINUTE,[sqlserver_start_time],GETDATE()) AS [uptime]
 		' + @Columns + '
+		affinity_type,
+		affinity_type_desc,
+		socket_count,
+		cores_per_socket,
+		numa_node_count
 	FROM sys.[dm_os_sys_info]'
 
 	/*Insert the dynamic sql result into the table variable*/
-	INSERT INTO @sys_info ( [cpu_count], [server_memory], [sku], [engine_edition], [uptime], [hardware_type] ) 
+	INSERT INTO @sys_info ( [cpu_count], [server_memory], [sku], [engine_edition], [uptime], [hardware_type], [affinity_type], [affinity_type_desc], [socket_count], [cores_per_socket], [numa_node_count]) 
 	EXEC sp_executesql @SqlStatement , N'@EngineEdition smallint', @EngineEdition = @EngineEdition
 END
 
 SELECT	'sqlserver_server_properties' AS [measurement],
 		REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
-		DB_NAME() as [database_name],
-		s.cpu_count,
-		s.server_memory,
-		s.sku,
-		s.engine_edition,
-		s.hardware_type,
-		s.total_storage_mb,
-		s.available_storage_mb,
-		s.uptime,
+		cpu_count,
+		server_memory,
+		sku,
+		engine_edition,
+		hardware_type,
+		total_storage_mb,
+		available_storage_mb,
+		uptime,
 		SERVERPROPERTY('ProductVersion') AS sql_version,
-		db_online,
-		db_restoring,
-		db_recovering,
-		db_recoveryPending,
-		db_suspect,
-		db_offline
-FROM	(
-			SELECT	SUM( CASE WHEN state = 0 THEN 1 ELSE 0 END ) AS db_online,
-					SUM( CASE WHEN state = 1 THEN 1 ELSE 0 END ) AS db_restoring,
-					SUM( CASE WHEN state = 2 THEN 1 ELSE 0 END ) AS db_recovering,
-					SUM( CASE WHEN state = 3 THEN 1 ELSE 0 END ) AS db_recoveryPending,
-					SUM( CASE WHEN state = 4 THEN 1 ELSE 0 END ) AS db_suspect,
-					SUM( CASE WHEN state = 6 or state = 10 THEN 1 ELSE 0 END ) AS db_offline
-			FROM	sys.databases
-		) AS dbs
-		CROSS APPLY (
-			SELECT	cpu_count, server_memory, sku, engine_edition, hardware_type, total_storage_mb, available_storage_mb, uptime
-			FROM	@sys_info
-		) AS s
+		affinity_type,
+		affinity_type_desc,
+		socket_count,
+		cores_per_socket,
+		numa_node_count
+FROM @sys_info
 `
 
 //Recommend disabling this by default, but is useful to detect single CPU spikes/bottlenecks
@@ -1301,7 +1465,6 @@ EXEC( @SqlStatement )
 
 SELECT	'sqlserver_performance' AS [measurement],
 		REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
-		DB_NAME() as [database_name],
 		pc.object_name AS [object],
 		pc.counter_name AS [counter],
 		CASE pc.instance_name WHEN '_Total' THEN 'Total' ELSE ISNULL(pc.instance_name,'') END AS [instance],
@@ -2024,16 +2187,16 @@ BEGIN
 `
 
 const sqlServerRequestsV2 string = `
-SET NOCOUNT ON; 
+SET NOCOUNT ON;
+IF(OBJECT_ID('tempdb..#blockingSessions') IS NOT NULL) DROP TABLE #blockingSessions;
 SELECT  blocking_session_id into #blockingSessions FROM sys.dm_exec_requests WHERE blocking_session_id != 0
 create index ix_blockingSessions_1 on #blockingSessions (blocking_session_id)
 SELECT	
    'sqlserver_requests' AS [measurement],
     REPLACE(@@SERVERNAME,'\',':') AS [sql_instance],
-    DB_NAME() as [database_name],
+    DB_NAME(r.database_id) as [database],
 	r.session_id
 	, r.request_id
-	, DB_NAME(r.database_id) as session_db_name
 	, r.status
 	, r.cpu_time as cpu_time_ms
 	, r.total_elapsed_time as total_elapsed_time_ms
@@ -2070,13 +2233,13 @@ SELECT
 	, DB_NAME(qt.dbid) stmt_db_name
 	,CONVERT(varchar(20),[query_hash],1) as [query_hash]
 	,CONVERT(varchar(20),[query_plan_hash],1) as [query_plan_hash]
-	FROM	sys.dm_exec_requests r
-		LEFT OUTER JOIN sys.dm_exec_sessions s ON (s.session_id = r.session_id)
+	FROM	sys.dm_exec_requests r WITH (NOLOCK)
+		LEFT OUTER JOIN sys.dm_exec_sessions s WITH (NOLOCK) ON (s.session_id = r.session_id)
 		OUTER APPLY sys.dm_exec_sql_text(sql_handle) AS qt
 		
-	WHERE	1=1
-	 AND (r.session_id IS NOT NULL AND (s.is_user_process = 1 OR r.status COLLATE Latin1_General_BIN NOT IN ('background', 'sleeping')))
-	 OR (s.session_id IN (SELECT blocking_session_id FROM #blockingSessions))
+	WHERE ((r.session_id IS NOT NULL AND (s.is_user_process = 1 OR r.status COLLATE Latin1_General_BIN NOT IN ('background', 'sleeping')))
+		OR (s.session_id IN (SELECT blocking_session_id FROM #blockingSessions)))
+		AND blocking_session_id > 0
 	 OPTION(MAXDOP 1)
 
 `
